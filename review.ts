@@ -1,43 +1,11 @@
 /**
- * Code Review Extension (inspired by Codex's review feature)
- *
- * Provides a `/review` command that prompts the agent to review code changes.
- * Supports multiple review modes:
- * - Review a GitHub pull request (checks out the PR locally)
- * - Review against a base branch (PR style)
- * - Review uncommitted changes
- * - Review a specific commit
- * - Shared custom review instructions (applied to all review modes when configured)
- *
- * Usage:
- * - `/review` - show interactive selector
- * - `/review pr 123` - review PR #123 (checks out locally)
- * - `/review pr https://github.com/owner/repo/pull/123` - review PR from URL
- * - `/review uncommitted` - review uncommitted changes directly
- * - `/review branch main` - review against main branch
- * - `/review commit abc123` - review specific commit
- * - `/review folder src docs` - review specific folders/files (snapshot, not diff)
- * - `/review` selector includes Add/Remove custom review instructions (applies to all modes)
- * - `/review --extra "focus on performance regressions"` - add extra review instruction (works with any mode)
- *
- * Project-specific review guidelines:
- * - If a REVIEW_GUIDELINES.md file exists in the same directory as .pi,
- *   its contents are appended to the review prompt.
- *
- * Note: PR review requires a clean working tree (no uncommitted changes to tracked files).
+ * Local review of uncommitted changes, retaining the original conversation
+ * branching and /end-review handoff workflow.
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, BorderedLoader } from "@earendil-works/pi-coding-agent";
-import {
-	Container,
-	fuzzyFilter,
-	Input,
-	type SelectItem,
-	SelectList,
-	Spacer,
-	Text,
-} from "@earendil-works/pi-tui";
+import { BorderedLoader } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 
@@ -46,23 +14,12 @@ import { promises as fs } from "node:fs";
 // This is intentional - the UI and /end-review command assume a single active review.
 let reviewOriginId: string | undefined = undefined;
 let endReviewInProgress = false;
-let reviewCustomInstructions: string | undefined = undefined;
 
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
-const REVIEW_SETTINGS_TYPE = "review-settings";
-const GH_SETUP_INSTRUCTIONS =
-	"Install GitHub CLI (`gh`) from https://cli.github.com/ (macOS: `brew install gh`), then sign in with `gh auth login` and verify with `gh auth status`.";
-const PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE =
-	"Cannot checkout PR: you have uncommitted changes. Please commit or stash them first.";
-
 type ReviewSessionState = {
 	active: boolean;
 	originId?: string;
-};
-
-type ReviewSettingsState = {
-	customInstructions?: string;
 };
 
 function setReviewWidget(ctx: ExtensionContext, active: boolean) {
@@ -110,55 +67,12 @@ function applyReviewState(ctx: ExtensionContext) {
 	setReviewWidget(ctx, false);
 }
 
-function getReviewSettings(ctx: ExtensionContext): ReviewSettingsState {
-	let state: ReviewSettingsState | undefined;
-	for (const entry of ctx.sessionManager.getEntries()) {
-		if (entry.type === "custom" && entry.customType === REVIEW_SETTINGS_TYPE) {
-			state = entry.data as ReviewSettingsState | undefined;
-		}
-	}
-
-	return {
-		customInstructions: state?.customInstructions?.trim() || undefined,
-	};
-}
-
-function applyReviewSettings(ctx: ExtensionContext) {
-	const state = getReviewSettings(ctx);
-	reviewCustomInstructions = state.customInstructions?.trim() || undefined;
-}
-
 // Review target types (matching Codex's approach)
-type ReviewTarget =
-	| { type: "uncommitted" }
-	| { type: "baseBranch"; branch: string }
-	| { type: "commit"; sha: string; title?: string }
-	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string }
-	| { type: "folder"; paths: string[] };
+type ReviewTarget = { type: "uncommitted" };
 
 // Prompts (adapted from Codex)
 const UNCOMMITTED_PROMPT =
 	"Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings.";
-
-const BASE_BRANCH_PROMPT_WITH_MERGE_BASE =
-	"Review the code changes against the base branch '{baseBranch}'. The merge base commit for this comparison is {mergeBaseSha}. Run `git diff {mergeBaseSha}` to inspect the changes relative to {baseBranch}. Provide prioritized, actionable findings.";
-
-const BASE_BRANCH_PROMPT_FALLBACK =
-	"Review the code changes against the base branch '{branch}'. Start by finding the merge diff between the current branch and {branch}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{branch}@{upstream}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {branch} branch. Provide prioritized, actionable findings.";
-
-const COMMIT_PROMPT_WITH_TITLE =
-	'Review the code changes introduced by commit {sha} ("{title}"). Provide prioritized, actionable findings.';
-
-const COMMIT_PROMPT = "Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings.";
-
-const PULL_REQUEST_PROMPT =
-	'Review pull request #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. The merge base commit for this comparison is {mergeBaseSha}. Run `git diff {mergeBaseSha}` to inspect the changes that would be merged. Provide prioritized, actionable findings.';
-
-const PULL_REQUEST_PROMPT_FALLBACK =
-	'Review pull request #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. Start by finding the merge base between the current branch and {baseBranch} (e.g., `git merge-base HEAD {baseBranch}`), then run `git diff` against that SHA to see the changes that would be merged. Provide prioritized, actionable findings.';
-
-const FOLDER_REVIEW_PROMPT =
-	"Review the code in the following paths: {paths}. This is a snapshot review (not a diff). Read the files directly in these paths and provide prioritized, actionable findings.";
 
 // The detailed review rubric (adapted from Codex's review_prompt.md)
 const REVIEW_RUBRIC = `# Review Guidelines
@@ -211,11 +125,10 @@ Flag issues that:
 
 ## Review priorities
 
-1. Surface critical non-blocking human callouts (migrations, dependency churn, auth/permissions, compatibility, destructive operations) at the end.
-2. Prefer simple, direct solutions over wrappers or abstractions without clear value.
-3. Treat back pressure handling as critical to system stability.
-4. Apply system-level thinking; flag changes that increase operational risk or on-call wakeups.
-5. Ensure that errors are always checked against codes or stable identifiers, never error messages.
+1. Prefer simple, direct solutions over wrappers or abstractions without clear value.
+2. Treat back pressure handling as critical to system stability.
+3. Apply system-level thinking; flag changes that increase operational risk or on-call wakeups.
+4. Ensure that errors are always checked against codes or stable identifiers, never error messages.
 
 ## Fail-fast error handling (strict)
 
@@ -228,31 +141,6 @@ When reviewing added or modified error handling, default to fail-fast behavior.
 5. Boundary handlers (HTTP routes, CLI entrypoints, supervisors) may translate errors, but must not pretend success or silently degrade.
 6. If a catch exists only to satisfy lint/style without real handling, treat it as a bug.
 7. When uncertain, prefer crashing fast over silent degradation.
-
-## Required human callouts (non-blocking, at the very end)
-
-After findings/verdict, you MUST append this final section:
-
-## Human Reviewer Callouts (Non-Blocking)
-
-Include only applicable callouts (no yes/no lines):
-
-- **This change adds a database migration:** <files/details>
-- **This change introduces a new dependency:** <package(s)/details>
-- **This change changes a dependency (or the lockfile):** <files/package(s)/details>
-- **This change modifies auth/permission behavior:** <what changed and where>
-- **This change introduces backwards-incompatible public schema/API/contract changes:** <what changed and where>
-- **This change includes irreversible or destructive operations:** <operation and scope>
-- **This change adds or removes feature flags:** <feature flags changed> (call out re-use of dormant feature flags!)
-- **This change changes configuration defaults:** <config var changed>
-
-Rules for this section:
-1. These are informational callouts for the human reviewer, not fix items.
-2. Do not include them in Findings unless there is an independent defect.
-3. These callouts alone must not change the verdict.
-4. Only include callouts that apply to the reviewed change.
-5. Keep each emitted callout bold exactly as written.
-6. If none apply, write "- (none)".
 
 ## Priority levels
 
@@ -271,9 +159,8 @@ Provide your findings in a clear, structured format:
 4. Provide an overall verdict: "correct" (no blocking issues) or "needs attention" (has blocking issues).
 5. Ignore trivial style issues unless they obscure meaning or violate documented standards.
 6. Do not generate a full PR fix — only flag issues and optionally provide short suggestion blocks.
-7. End with the required "Human Reviewer Callouts (Non-Blocking)" section and all applicable bold callouts (no yes/no).
 
-Output all findings the author would fix if they knew about them. If there are no qualifying findings, explicitly state the code looks good. Don't stop at the first finding - list every qualifying issue. Then append the required non-blocking callouts section.`;
+Output all findings the author would fix if they knew about them. If there are no qualifying findings, explicitly state the code looks good. Don't stop at the first finding - list every qualifying issue.`;
 
 async function loadProjectReviewGuidelines(cwd: string): Promise<string | null> {
 	let currentDir = path.resolve(cwd);
@@ -305,183 +192,6 @@ async function loadProjectReviewGuidelines(cwd: string): Promise<string | null> 
 	}
 }
 
-/**
- * Get the merge base between HEAD and a branch
- */
-async function getMergeBase(
-	pi: ExtensionAPI,
-	branch: string,
-): Promise<string | null> {
-	try {
-		// First try to get the upstream tracking branch
-		const { stdout: upstream, code: upstreamCode } = await pi.exec("git", [
-			"rev-parse",
-			"--abbrev-ref",
-			`${branch}@{upstream}`,
-		]);
-
-		if (upstreamCode === 0 && upstream.trim()) {
-			const { stdout: mergeBase, code } = await pi.exec("git", ["merge-base", "HEAD", upstream.trim()]);
-			if (code === 0 && mergeBase.trim()) {
-				return mergeBase.trim();
-			}
-		}
-
-		// Fall back to using the branch directly
-		const { stdout: mergeBase, code } = await pi.exec("git", ["merge-base", "HEAD", branch]);
-		if (code === 0 && mergeBase.trim()) {
-			return mergeBase.trim();
-		}
-
-		return null;
-	} catch {
-		return null;
-	}
-}
-
-/**
- * Get list of local branches
- */
-async function getLocalBranches(pi: ExtensionAPI): Promise<string[]> {
-	const { stdout, code } = await pi.exec("git", ["branch", "--format=%(refname:short)"]);
-	if (code !== 0) return [];
-	return stdout
-		.trim()
-		.split("\n")
-		.filter((b) => b.trim());
-}
-
-/**
- * Get list of recent commits
- */
-async function getRecentCommits(pi: ExtensionAPI, limit: number = 10): Promise<Array<{ sha: string; title: string }>> {
-	const { stdout, code } = await pi.exec("git", ["log", `--oneline`, `-n`, `${limit}`]);
-	if (code !== 0) return [];
-
-	return stdout
-		.trim()
-		.split("\n")
-		.filter((line) => line.trim())
-		.map((line) => {
-			const [sha, ...rest] = line.trim().split(" ");
-			return { sha, title: rest.join(" ") };
-		});
-}
-
-/**
- * Check if there are uncommitted changes (staged, unstaged, or untracked)
- */
-async function hasUncommittedChanges(pi: ExtensionAPI): Promise<boolean> {
-	const { stdout, code } = await pi.exec("git", ["status", "--porcelain"]);
-	return code === 0 && stdout.trim().length > 0;
-}
-
-/**
- * Check if there are changes that would prevent switching branches
- * (staged or unstaged changes to tracked files - untracked files are fine)
- */
-async function hasPendingChanges(pi: ExtensionAPI): Promise<boolean> {
-	// Check for staged or unstaged changes to tracked files
-	const { stdout, code } = await pi.exec("git", ["status", "--porcelain"]);
-	if (code !== 0) return false;
-
-	// Filter out untracked files (lines starting with ??)
-	const lines = stdout.trim().split("\n").filter((line) => line.trim());
-	const trackedChanges = lines.filter((line) => !line.startsWith("??"));
-	return trackedChanges.length > 0;
-}
-
-/**
- * Parse a PR reference (URL or number) and return the PR number
- */
-function parsePrReference(ref: string): number | null {
-	const trimmed = ref.trim();
-
-	// Try as a number first
-	const num = parseInt(trimmed, 10);
-	if (!isNaN(num) && num > 0) {
-		return num;
-	}
-
-	// Try to extract from GitHub URL
-	// Formats: https://github.com/owner/repo/pull/123
-	//          github.com/owner/repo/pull/123
-	const urlMatch = trimmed.match(/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/);
-	if (urlMatch) {
-		return parseInt(urlMatch[1], 10);
-	}
-
-	return null;
-}
-
-/**
- * Get PR information from GitHub CLI
- */
-async function getPrInfo(pi: ExtensionAPI, prNumber: number): Promise<{ baseBranch: string; title: string; headBranch: string } | null> {
-	const { stdout, code } = await pi.exec("gh", [
-		"pr", "view", String(prNumber),
-		"--json", "baseRefName,title,headRefName",
-	]);
-
-	if (code !== 0) return null;
-
-	try {
-		const data = JSON.parse(stdout);
-		return {
-			baseBranch: data.baseRefName,
-			title: data.title,
-			headBranch: data.headRefName,
-		};
-	} catch {
-		return null;
-	}
-}
-
-/**
- * Checkout a PR using GitHub CLI
- */
-async function checkoutPr(pi: ExtensionAPI, prNumber: number): Promise<{ success: boolean; error?: string }> {
-	const { stdout, stderr, code } = await pi.exec("gh", ["pr", "checkout", String(prNumber)]);
-
-	if (code !== 0) {
-		return { success: false, error: stderr || stdout || "Failed to checkout PR" };
-	}
-
-	return { success: true };
-}
-
-/**
- * Get the current branch name
- */
-async function getCurrentBranch(pi: ExtensionAPI): Promise<string | null> {
-	const { stdout, code } = await pi.exec("git", ["branch", "--show-current"]);
-	if (code === 0 && stdout.trim()) {
-		return stdout.trim();
-	}
-	return null;
-}
-
-/**
- * Get the default branch (main or master)
- */
-async function getDefaultBranch(pi: ExtensionAPI): Promise<string> {
-	// Try to get from remote HEAD
-	const { stdout, code } = await pi.exec("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"]);
-	if (code === 0 && stdout.trim()) {
-		return stdout.trim().replace("origin/", "");
-	}
-
-	// Fall back to checking if main or master exists
-	const branches = await getLocalBranches(pi);
-	if (branches.includes("main")) return "main";
-	if (branches.includes("master")) return "master";
-
-	return "main"; // Default fallback
-}
-
-/**
- * Build the review prompt based on target
- */
 async function buildReviewPrompt(
 	pi: ExtensionAPI,
 	target: ReviewTarget,
@@ -490,37 +200,6 @@ async function buildReviewPrompt(
 		case "uncommitted":
 			return UNCOMMITTED_PROMPT;
 
-		case "baseBranch": {
-			const mergeBase = await getMergeBase(pi, target.branch);
-			const basePrompt = mergeBase
-				? BASE_BRANCH_PROMPT_WITH_MERGE_BASE.replace(/{baseBranch}/g, target.branch).replace(/{mergeBaseSha}/g, mergeBase)
-				: BASE_BRANCH_PROMPT_FALLBACK.replace(/{branch}/g, target.branch);
-			return basePrompt;
-		}
-
-		case "commit":
-			if (target.title) {
-				return COMMIT_PROMPT_WITH_TITLE.replace("{sha}", target.sha).replace("{title}", target.title);
-			}
-			return COMMIT_PROMPT.replace("{sha}", target.sha);
-
-		case "pullRequest": {
-			const mergeBase = await getMergeBase(pi, target.baseBranch);
-			const basePrompt = mergeBase
-				? PULL_REQUEST_PROMPT
-						.replace(/{prNumber}/g, String(target.prNumber))
-						.replace(/{title}/g, target.title)
-						.replace(/{baseBranch}/g, target.baseBranch)
-						.replace(/{mergeBaseSha}/g, mergeBase)
-				: PULL_REQUEST_PROMPT_FALLBACK
-						.replace(/{prNumber}/g, String(target.prNumber))
-						.replace(/{title}/g, target.title)
-						.replace(/{baseBranch}/g, target.baseBranch);
-			return basePrompt;
-		}
-
-		case "folder":
-			return FOLDER_REVIEW_PROMPT.replace("{paths}", target.paths.join(", "));
 	}
 }
 
@@ -531,128 +210,12 @@ function getUserFacingHint(target: ReviewTarget): string {
 	switch (target.type) {
 		case "uncommitted":
 			return "current changes";
-		case "baseBranch":
-			return `changes against '${target.branch}'`;
-		case "commit": {
-			const shortSha = target.sha.slice(0, 7);
-			return target.title ? `commit ${shortSha}: ${target.title}` : `commit ${shortSha}`;
-		}
-
-		case "pullRequest": {
-			const shortTitle = target.title.length > 30 ? target.title.slice(0, 27) + "..." : target.title;
-			return `PR #${target.prNumber}: ${shortTitle}`;
-		}
-
-		case "folder": {
-			const joined = target.paths.join(", ");
-			return joined.length > 40 ? `folders: ${joined.slice(0, 37)}...` : `folders: ${joined}`;
-		}
 	}
 }
 
-// Review preset options for the selector (keep this order stable)
-const REVIEW_PRESETS = [
-	{ value: "uncommitted", label: "Review uncommitted changes", description: "" },
-	{ value: "baseBranch", label: "Review against a base branch", description: "(local)" },
-	{ value: "commit", label: "Review a commit", description: "" },
-	{ value: "pullRequest", label: "Review a pull request", description: "(GitHub PR)" },
-	{ value: "folder", label: "Review a folder (or more)", description: "(snapshot, not diff)" },
-] as const;
-
-const TOGGLE_CUSTOM_INSTRUCTIONS_VALUE = "toggleCustomInstructions" as const;
-type ReviewPresetValue =
-	| (typeof REVIEW_PRESETS)[number]["value"]
-	| typeof TOGGLE_CUSTOM_INSTRUCTIONS_VALUE;
-
 export default function reviewExtension(pi: ExtensionAPI) {
-	function persistReviewSettings() {
-		pi.appendEntry(REVIEW_SETTINGS_TYPE, {
-			customInstructions: reviewCustomInstructions,
-		});
-	}
-
-	function setReviewCustomInstructions(instructions: string | undefined) {
-		reviewCustomInstructions = instructions?.trim() || undefined;
-		persistReviewSettings();
-	}
-
 	function applyAllReviewState(ctx: ExtensionContext) {
-		applyReviewSettings(ctx);
 		applyReviewState(ctx);
-	}
-
-	async function ensureGithubCliReady(ctx: ExtensionContext): Promise<boolean> {
-		const ghVersion = await pi.exec("gh", ["--version"]);
-		if (ghVersion.code !== 0) {
-			ctx.ui.notify(`PR review requires GitHub CLI (\`gh\`). ${GH_SETUP_INSTRUCTIONS}`, "error");
-			return false;
-		}
-
-		const ghAuthStatus = await pi.exec("gh", ["auth", "status"]);
-		if (ghAuthStatus.code !== 0) {
-			ctx.ui.notify(
-				"GitHub CLI is installed, but you're not signed in. Run `gh auth login`, then verify with `gh auth status`.",
-				"error",
-			);
-			return false;
-		}
-
-		return true;
-	}
-
-	async function resolvePullRequestTarget(
-		ctx: ExtensionContext,
-		ref: string,
-		options: { skipInitialPendingChangesCheck?: boolean } = {},
-	): Promise<ReviewTarget | null> {
-		if (!(await ensureGithubCliReady(ctx))) {
-			return null;
-		}
-
-		if (!options.skipInitialPendingChangesCheck && (await hasPendingChanges(pi))) {
-			ctx.ui.notify(PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE, "error");
-			return null;
-		}
-
-		const prNumber = parsePrReference(ref);
-		if (!prNumber) {
-			ctx.ui.notify("Invalid PR reference. Enter a number or GitHub PR URL.", "error");
-			return null;
-		}
-
-		ctx.ui.notify(`Fetching PR #${prNumber} info...`, "info");
-		const prInfo = await getPrInfo(pi, prNumber);
-
-		if (!prInfo) {
-			ctx.ui.notify(
-				`Could not fetch PR #${prNumber}. Make sure it exists and your GitHub auth has access (check with \`gh auth status\`).`,
-				"error",
-			);
-			return null;
-		}
-
-		// Re-check right before checkout to avoid switching branches with newly introduced changes.
-		if (await hasPendingChanges(pi)) {
-			ctx.ui.notify(PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE, "error");
-			return null;
-		}
-
-		ctx.ui.notify(`Checking out PR #${prNumber}...`, "info");
-		const checkoutResult = await checkoutPr(pi, prNumber);
-
-		if (!checkoutResult.success) {
-			ctx.ui.notify(`Failed to checkout PR: ${checkoutResult.error}`, "error");
-			return null;
-		}
-
-		ctx.ui.notify(`Checked out PR #${prNumber} (${prInfo.headBranch})`, "info");
-
-		return {
-			type: "pullRequest",
-			prNumber,
-			baseBranch: prInfo.baseBranch,
-			title: prInfo.title,
-		};
 	}
 
 	pi.on("session_start", (_event, ctx) => {
@@ -665,425 +228,12 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	});
 
 	/**
-	 * Determine the smart default review type based on git state
-	 */
-	async function getSmartDefault(): Promise<"uncommitted" | "baseBranch" | "commit"> {
-		// Priority 1: If there are uncommitted changes, default to reviewing them
-		if (await hasUncommittedChanges(pi)) {
-			return "uncommitted";
-		}
-
-		// Priority 2: If on a feature branch (not the default branch), default to PR-style review
-		const currentBranch = await getCurrentBranch(pi);
-		const defaultBranch = await getDefaultBranch(pi);
-		if (currentBranch && currentBranch !== defaultBranch) {
-			return "baseBranch";
-		}
-
-		// Priority 3: Default to reviewing a specific commit
-		return "commit";
-	}
-
-	/**
-	 * Show the review preset selector
-	 */
-	async function showReviewSelector(ctx: ExtensionContext): Promise<ReviewTarget | null> {
-		// Determine smart default (but keep the list order stable)
-		const smartDefault = await getSmartDefault();
-		const presetItems: SelectItem[] = REVIEW_PRESETS.map((preset) => ({
-			value: preset.value,
-			label: preset.label,
-			description: preset.description,
-		}));
-		const smartDefaultIndex = presetItems.findIndex((item) => item.value === smartDefault);
-
-		while (true) {
-			const customInstructionsLabel = reviewCustomInstructions
-				? "Remove custom review instructions"
-				: "Add custom review instructions";
-			const customInstructionsDescription = reviewCustomInstructions
-				? "(currently set)"
-				: "(applies to all review modes)";
-			const items: SelectItem[] = [
-				...presetItems,
-				{
-					value: TOGGLE_CUSTOM_INSTRUCTIONS_VALUE,
-					label: customInstructionsLabel,
-					description: customInstructionsDescription,
-				},
-			];
-
-			const result = await ctx.ui.custom<ReviewPresetValue | null>((tui, theme, _kb, done) => {
-				const container = new Container();
-				container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-				container.addChild(new Text(theme.fg("accent", theme.bold("Select a review preset"))));
-
-				const selectList = new SelectList(items, Math.min(items.length, 10), {
-					selectedPrefix: (text) => theme.fg("accent", text),
-					selectedText: (text) => theme.fg("accent", text),
-					description: (text) => theme.fg("muted", text),
-					scrollInfo: (text) => theme.fg("dim", text),
-					noMatch: (text) => theme.fg("warning", text),
-				});
-
-				// Preselect the smart default without reordering the list
-				if (smartDefaultIndex >= 0) {
-					selectList.setSelectedIndex(smartDefaultIndex);
-				}
-
-				selectList.onSelect = (item) => done(item.value as ReviewPresetValue);
-				selectList.onCancel = () => done(null);
-
-				container.addChild(selectList);
-				container.addChild(new Text(theme.fg("dim", "Press enter to confirm or esc to go back")));
-				container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-
-				return {
-					render(width: number) {
-						return container.render(width);
-					},
-					invalidate() {
-						container.invalidate();
-					},
-					handleInput(data: string) {
-						selectList.handleInput(data);
-						tui.requestRender();
-					},
-				};
-			});
-
-			if (!result) return null;
-
-			if (result === TOGGLE_CUSTOM_INSTRUCTIONS_VALUE) {
-				if (reviewCustomInstructions) {
-					setReviewCustomInstructions(undefined);
-					ctx.ui.notify("Custom review instructions removed", "info");
-					continue;
-				}
-
-				const customInstructions = await ctx.ui.editor(
-					"Enter custom review instructions (applies to all review modes):",
-					"",
-				);
-
-				if (!customInstructions?.trim()) {
-					ctx.ui.notify("Custom review instructions not changed", "info");
-					continue;
-				}
-
-				setReviewCustomInstructions(customInstructions);
-				ctx.ui.notify("Custom review instructions saved", "info");
-				continue;
-			}
-
-			// Handle each preset type
-			switch (result) {
-				case "uncommitted":
-					return { type: "uncommitted" };
-
-				case "baseBranch": {
-					const target = await showBranchSelector(ctx);
-					if (target) return target;
-					break;
-				}
-
-				case "commit": {
-					const target = await showCommitSelector(ctx);
-					if (target) return target;
-					break;
-				}
-
-				case "folder": {
-					const target = await showFolderInput(ctx);
-					if (target) return target;
-					break;
-				}
-
-				case "pullRequest": {
-					const target = await showPrInput(ctx);
-					if (target) return target;
-					break;
-				}
-
-				default:
-					return null;
-			}
-		}
-	}
-
-	/**
-	 * Show branch selector for base branch review
-	 */
-	async function showBranchSelector(ctx: ExtensionContext): Promise<ReviewTarget | null> {
-		const branches = await getLocalBranches(pi);
-		const currentBranch = await getCurrentBranch(pi);
-		const defaultBranch = await getDefaultBranch(pi);
-
-		// Never offer the current branch as a base branch (reviewing against itself is meaningless).
-		const candidateBranches = currentBranch ? branches.filter((b) => b !== currentBranch) : branches;
-
-		if (candidateBranches.length === 0) {
-			ctx.ui.notify(
-				currentBranch ? `No other branches found (current branch: ${currentBranch})` : "No branches found",
-				"error",
-			);
-			return null;
-		}
-
-		// Sort branches with default branch first
-		const sortedBranches = candidateBranches.sort((a, b) => {
-			if (a === defaultBranch) return -1;
-			if (b === defaultBranch) return 1;
-			return a.localeCompare(b);
-		});
-
-		const items: SelectItem[] = sortedBranches.map((branch) => ({
-			value: branch,
-			label: branch,
-			description: branch === defaultBranch ? "(default)" : "",
-		}));
-
-		const result = await ctx.ui.custom<string | null>((tui, theme, keybindings, done) => {
-			const container = new Container();
-			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-			container.addChild(new Text(theme.fg("accent", theme.bold("Select base branch"))));
-
-			const searchInput = new Input();
-			container.addChild(searchInput);
-			container.addChild(new Spacer(1));
-
-			const listContainer = new Container();
-			container.addChild(listContainer);
-			container.addChild(new Text(theme.fg("dim", "Type to filter • enter to select • esc to cancel")));
-			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-
-			let filteredItems = items;
-			let selectList: SelectList | null = null;
-
-			const updateList = () => {
-				listContainer.clear();
-				if (filteredItems.length === 0) {
-					listContainer.addChild(new Text(theme.fg("warning", "  No matching branches")));
-					selectList = null;
-					return;
-				}
-
-				selectList = new SelectList(filteredItems, Math.min(filteredItems.length, 10), {
-					selectedPrefix: (text) => theme.fg("accent", text),
-					selectedText: (text) => theme.fg("accent", text),
-					description: (text) => theme.fg("muted", text),
-					scrollInfo: (text) => theme.fg("dim", text),
-					noMatch: (text) => theme.fg("warning", text),
-				});
-
-				selectList.onSelect = (item) => done(item.value);
-				selectList.onCancel = () => done(null);
-				listContainer.addChild(selectList);
-			};
-
-			const applyFilter = () => {
-				const query = searchInput.getValue();
-				filteredItems = query
-					? fuzzyFilter(items, query, (item) => `${item.label} ${item.value} ${item.description ?? ""}`)
-					: items;
-				updateList();
-			};
-
-			applyFilter();
-
-			return {
-				render(width: number) {
-					return container.render(width);
-				},
-				invalidate() {
-					container.invalidate();
-				},
-				handleInput(data: string) {
-					if (
-						keybindings.matches(data, "tui.select.up") ||
-						keybindings.matches(data, "tui.select.down") ||
-						keybindings.matches(data, "tui.select.confirm") ||
-						keybindings.matches(data, "tui.select.cancel")
-					) {
-						if (selectList) {
-							selectList.handleInput(data);
-						} else if (keybindings.matches(data, "tui.select.cancel")) {
-							done(null);
-						}
-						tui.requestRender();
-						return;
-					}
-
-					searchInput.handleInput(data);
-					applyFilter();
-					tui.requestRender();
-				},
-			};
-		});
-
-		if (!result) return null;
-		return { type: "baseBranch", branch: result };
-	}
-
-	/**
-	 * Show commit selector
-	 */
-	async function showCommitSelector(ctx: ExtensionContext): Promise<ReviewTarget | null> {
-		const commits = await getRecentCommits(pi, 20);
-
-		if (commits.length === 0) {
-			ctx.ui.notify("No commits found", "error");
-			return null;
-		}
-
-		const items: SelectItem[] = commits.map((commit) => ({
-			value: commit.sha,
-			label: `${commit.sha.slice(0, 7)} ${commit.title}`,
-			description: "",
-		}));
-
-		const result = await ctx.ui.custom<{ sha: string; title: string } | null>((tui, theme, keybindings, done) => {
-			const container = new Container();
-			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-			container.addChild(new Text(theme.fg("accent", theme.bold("Select commit to review"))));
-
-			const searchInput = new Input();
-			container.addChild(searchInput);
-			container.addChild(new Spacer(1));
-
-			const listContainer = new Container();
-			container.addChild(listContainer);
-			container.addChild(new Text(theme.fg("dim", "Type to filter • enter to select • esc to cancel")));
-			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-
-			let filteredItems = items;
-			let selectList: SelectList | null = null;
-
-			const updateList = () => {
-				listContainer.clear();
-				if (filteredItems.length === 0) {
-					listContainer.addChild(new Text(theme.fg("warning", "  No matching commits")));
-					selectList = null;
-					return;
-				}
-
-				selectList = new SelectList(filteredItems, Math.min(filteredItems.length, 10), {
-					selectedPrefix: (text) => theme.fg("accent", text),
-					selectedText: (text) => theme.fg("accent", text),
-					description: (text) => theme.fg("muted", text),
-					scrollInfo: (text) => theme.fg("dim", text),
-					noMatch: (text) => theme.fg("warning", text),
-				});
-
-				selectList.onSelect = (item) => {
-					const commit = commits.find((c) => c.sha === item.value);
-					if (commit) {
-						done(commit);
-					} else {
-						done(null);
-					}
-				};
-				selectList.onCancel = () => done(null);
-				listContainer.addChild(selectList);
-			};
-
-			const applyFilter = () => {
-				const query = searchInput.getValue();
-				filteredItems = query
-					? fuzzyFilter(items, query, (item) => `${item.label} ${item.value} ${item.description ?? ""}`)
-					: items;
-				updateList();
-			};
-
-			applyFilter();
-
-			return {
-				render(width: number) {
-					return container.render(width);
-				},
-				invalidate() {
-					container.invalidate();
-				},
-				handleInput(data: string) {
-					if (
-						keybindings.matches(data, "tui.select.up") ||
-						keybindings.matches(data, "tui.select.down") ||
-						keybindings.matches(data, "tui.select.confirm") ||
-						keybindings.matches(data, "tui.select.cancel")
-					) {
-						if (selectList) {
-							selectList.handleInput(data);
-						} else if (keybindings.matches(data, "tui.select.cancel")) {
-							done(null);
-						}
-						tui.requestRender();
-						return;
-					}
-
-					searchInput.handleInput(data);
-					applyFilter();
-					tui.requestRender();
-				},
-			};
-		});
-
-		if (!result) return null;
-		return { type: "commit", sha: result.sha, title: result.title };
-	}
-
-
-	function parseReviewPaths(value: string): string[] {
-		return value
-			.split(/\s+/)
-			.map((item) => item.trim())
-			.filter((item) => item.length > 0);
-	}
-
-	/**
-	 * Show folder input
-	 */
-	async function showFolderInput(ctx: ExtensionContext): Promise<ReviewTarget | null> {
-		const result = await ctx.ui.editor(
-			"Enter folders/files to review (space-separated or one per line):",
-			".",
-		);
-
-		if (!result?.trim()) return null;
-		const paths = parseReviewPaths(result);
-		if (paths.length === 0) return null;
-
-		return { type: "folder", paths };
-	}
-
-	/**
-	 * Show PR input and handle checkout
-	 */
-	async function showPrInput(ctx: ExtensionContext): Promise<ReviewTarget | null> {
-		// First check for pending changes that would prevent branch switching
-		if (await hasPendingChanges(pi)) {
-			ctx.ui.notify(PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE, "error");
-			return null;
-		}
-
-		// Get PR reference from user
-		const prRef = await ctx.ui.editor(
-			"Enter PR number or URL (e.g. 123 or https://github.com/owner/repo/pull/123):",
-			"",
-		);
-
-		if (!prRef?.trim()) return null;
-
-		return await resolvePullRequestTarget(ctx, prRef, { skipInitialPendingChangesCheck: true });
-	}
-
-	/**
 	 * Execute the review
 	 */
 	async function executeReview(
 		ctx: ExtensionCommandContext,
 		target: ReviewTarget,
 		useFreshSession: boolean,
-		options?: { extraInstruction?: string },
 	): Promise<boolean> {
 		// Check if we're already in a review
 		if (reviewOriginId) {
@@ -1153,14 +303,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		// Combine the review rubric with the specific prompt
 		let fullPrompt = `${REVIEW_RUBRIC}\n\n---\n\nPlease perform a code review with the following focus:\n\n${prompt}`;
 
-		if (reviewCustomInstructions) {
-			fullPrompt += `\n\nShared custom review instructions (applies to all reviews):\n\n${reviewCustomInstructions}`;
-		}
-
-		if (options?.extraInstruction?.trim()) {
-			fullPrompt += `\n\nAdditional user-provided review instruction:\n\n${options.extraInstruction.trim()}`;
-		}
-
 		if (projectGuidelines) {
 			fullPrompt += `\n\nThis project has additional instructions for code reviews:\n\n${projectGuidelines}`;
 		}
@@ -1173,139 +315,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		return true;
 	}
 
-	/**
-	 * Parse command arguments for direct invocation
-	 * Returns the target or a special marker for PR that needs async handling
-	 */
-	type ParsedReviewArgs = {
-		target: ReviewTarget | { type: "pr"; ref: string } | null;
-		extraInstruction?: string;
-		error?: string;
-	};
-
-	function tokenizeArgs(value: string): string[] {
-		const tokens: string[] = [];
-		let current = "";
-		let quote: '"' | "'" | null = null;
-
-		for (let i = 0; i < value.length; i++) {
-			const char = value[i];
-
-			if (quote) {
-				if (char === "\\" && i + 1 < value.length) {
-					current += value[i + 1];
-					i += 1;
-					continue;
-				}
-				if (char === quote) {
-					quote = null;
-					continue;
-				}
-				current += char;
-				continue;
-			}
-
-			if (char === '"' || char === "'") {
-				quote = char;
-				continue;
-			}
-
-			if (/\s/.test(char)) {
-				if (current.length > 0) {
-					tokens.push(current);
-					current = "";
-				}
-				continue;
-			}
-
-			current += char;
-		}
-
-		if (current.length > 0) {
-			tokens.push(current);
-		}
-
-		return tokens;
-	}
-
-	function parseArgs(args: string | undefined): ParsedReviewArgs {
-		if (!args?.trim()) return { target: null };
-
-		const rawParts = tokenizeArgs(args.trim());
-		const parts: string[] = [];
-		let extraInstruction: string | undefined;
-
-		for (let i = 0; i < rawParts.length; i++) {
-			const part = rawParts[i];
-			if (part === "--extra") {
-				const next = rawParts[i + 1];
-				if (!next) {
-					return { target: null, error: "Missing value for --extra" };
-				}
-				extraInstruction = next;
-				i += 1;
-				continue;
-			}
-
-			if (part.startsWith("--extra=")) {
-				extraInstruction = part.slice("--extra=".length);
-				continue;
-			}
-
-			parts.push(part);
-		}
-
-		if (parts.length === 0) {
-			return { target: null, extraInstruction };
-		}
-
-		const subcommand = parts[0]?.toLowerCase();
-
-		switch (subcommand) {
-			case "uncommitted":
-				return { target: { type: "uncommitted" }, extraInstruction };
-
-			case "branch": {
-				const branch = parts[1];
-				if (!branch) return { target: null, extraInstruction };
-				return { target: { type: "baseBranch", branch }, extraInstruction };
-			}
-
-			case "commit": {
-				const sha = parts[1];
-				if (!sha) return { target: null, extraInstruction };
-				const title = parts.slice(2).join(" ") || undefined;
-				return { target: { type: "commit", sha, title }, extraInstruction };
-			}
-
-
-			case "folder": {
-				const paths = parseReviewPaths(parts.slice(1).join(" "));
-				if (paths.length === 0) return { target: null, extraInstruction };
-				return { target: { type: "folder", paths }, extraInstruction };
-			}
-
-			case "pr": {
-				const ref = parts[1];
-				if (!ref) return { target: null, extraInstruction };
-				return { target: { type: "pr", ref }, extraInstruction };
-			}
-
-			default:
-				return { target: null, extraInstruction };
-		}
-	}
-
-	/**
-	 * Handle PR checkout and return a ReviewTarget (or null on failure)
-	 */
-	async function handlePrCheckout(ctx: ExtensionContext, ref: string): Promise<ReviewTarget | null> {
-		return await resolvePullRequestTarget(ctx, ref);
-	}
-
 	// Register the /review command
 	pi.registerCommand("review", {
-		description: "Review code changes (PR, uncommitted, branch, commit, or folder)",
+		description: "Review uncommitted changes",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Review requires interactive mode", "error");
@@ -1325,71 +337,24 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			// Try to parse direct arguments
-			let target: ReviewTarget | null = null;
-			let fromSelector = false;
-			let extraInstruction: string | undefined;
-			const parsed = parseArgs(args);
-			if (parsed.error) {
-				ctx.ui.notify(parsed.error, "error");
+			if (args.trim().toLowerCase() !== "uncommitted") {
+				ctx.ui.notify("Use /review uncommitted", "info");
 				return;
 			}
-			extraInstruction = parsed.extraInstruction?.trim() || undefined;
 
-			if (parsed.target) {
-				if (parsed.target.type === "pr") {
-					// Handle PR checkout (async operation)
-					target = await handlePrCheckout(ctx, parsed.target.ref);
-					if (!target) {
-						ctx.ui.notify("PR review failed. Returning to review menu.", "warning");
-					}
-				} else {
-					target = parsed.target;
-				}
-			}
-
-			// If no args or invalid args, show selector
-			if (!target) {
-				fromSelector = true;
-			}
-
-			while (true) {
-				if (!target && fromSelector) {
-					target = await showReviewSelector(ctx);
-				}
-
-				if (!target) {
+			const entries = ctx.sessionManager.getEntries();
+			const messageCount = entries.filter((e) => e.type === "message").length;
+			let useFreshSession = messageCount === 0;
+			if (messageCount > 0) {
+				const choice = await ctx.ui.select("Start review in:", ["Empty branch", "Current session"]);
+				if (choice === undefined) {
 					ctx.ui.notify("Review cancelled", "info");
 					return;
 				}
-
-				// Determine if we should use fresh session mode
-				// Check if this is a new session (no messages yet)
-				const entries = ctx.sessionManager.getEntries();
-				const messageCount = entries.filter((e) => e.type === "message").length;
-
-				// In an empty session, default to fresh review mode so /end-review works consistently.
-				let useFreshSession = messageCount === 0;
-
-				if (messageCount > 0) {
-					// Existing session - ask user which mode they want
-					const choice = await ctx.ui.select("Start review in:", ["Empty branch", "Current session"]);
-
-					if (choice === undefined) {
-						if (fromSelector) {
-							target = null;
-							continue;
-						}
-						ctx.ui.notify("Review cancelled", "info");
-						return;
-					}
-
-					useFreshSession = choice === "Empty branch";
-				}
-
-				await executeReview(ctx, target, useFreshSession, { extraInstruction });
-				return;
+				useFreshSession = choice === "Empty branch";
 			}
+
+			await executeReview(ctx, { type: "uncommitted" }, useFreshSession);
 		},
 	});
 
@@ -1422,19 +387,6 @@ For EACH finding, include:
 - Any constraints or preferences mentioned during review
 - Or "(none)"
 
-## Human Reviewer Callouts (Non-Blocking)
-Include only applicable callouts (no yes/no lines):
-- **This change adds a database migration:** <files/details>
-- **This change introduces a new dependency:** <package(s)/details>
-- **This change changes a dependency (or the lockfile):** <files/package(s)/details>
-- **This change modifies auth/permission behavior:** <what changed and where>
-- **This change introduces backwards-incompatible public schema/API/contract changes:** <what changed and where>
-- **This change includes irreversible or destructive operations:** <operation and scope>
-
-If none apply, write "- (none)".
-
-These are informational callouts for humans and are not fix items by themselves.
-
 Preserve exact file paths, function names, and error messages where available.`;
 
 	const REVIEW_FIX_FINDINGS_PROMPT = `Use the latest review summary in this session and implement the review findings now.
@@ -1443,12 +395,11 @@ Instructions:
 1. Treat the summary's Findings/Fix Queue as a checklist.
 2. Fix in priority order: P0, P1, then P2 (include P3 if quick and safe).
 3. If a finding is invalid/already fixed/not possible right now, briefly explain why and continue.
-4. Treat "Human Reviewer Callouts (Non-Blocking)" as informational only; do not convert them into fix tasks unless there is a separate explicit finding.
-5. Follow fail-fast error handling: do not add local catch/fallback recovery unless this scope is an explicit boundary that can safely translate the failure.
-6. If you add or keep a \`try/catch\`, explain the expected failure mode and either rethrow with context or return a boundary-safe error response.
-7. JSON parsing/decoding should fail loudly by default; avoid silent fallback parsing.
-8. Run relevant tests/checks for touched code where practical.
-9. End with: fixed items, deferred/skipped items (with reasons), and verification results.`;
+4. Follow fail-fast error handling: do not add local catch/fallback recovery unless this scope is an explicit boundary that can safely translate the failure.
+5. If you add or keep a \`try/catch\`, explain the expected failure mode and either rethrow with context or return a boundary-safe error response.
+6. JSON parsing/decoding should fail loudly by default; avoid silent fallback parsing.
+7. Run relevant tests/checks for touched code where practical.
+8. End with: fixed items, deferred/skipped items (with reasons), and verification results.`;
 
 	type EndReviewAction = "returnOnly" | "returnAndFix" | "returnAndSummarize";
 	type EndReviewActionResult = "ok" | "cancelled" | "error";
