@@ -1,7 +1,12 @@
 {
-  "name": "@earendil-works/pi-review",
-  "version": "0.1.0",
-  "description": "Standalone /review extension for pi coding agent",
+  "name": "@grothesque/pi-flex-review",
+  "version": "0.0.0",
+  "description": "Independent reviews in Pi with free-form requests and selectable context",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/grothesque/pi-flex-review.git"
+  },
   "type": "module",
   "exports": {
     ".": {
@@ -19,10 +24,8 @@
       "./review.ts"
     ]
   },
-  "dependencies": {},
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
