@@ -4,6 +4,7 @@
  * Usage in Pi:
  *   /review [request]           choose conversation context and start a review
  *   /review --fresh [request]   review without conversation history
+ *   /review --resume [request]  continue the previous review
  *   /end-review                 return, optionally summarizing or fixing findings
  *
  * The request defaults to "uncommitted changes".
@@ -45,7 +46,7 @@ State the reviewed scope and overall assessment. Preserve every actionable findi
 
 const FIX_PROMPT = `Act on the review findings in the latest review summary. Address correctness issues first, then worthwhile design improvements. If a finding is invalid or requires a decision, explain rather than blindly applying it. Stay within the reviewed scope and project conventions. Run relevant checks after making changes, and summarize changes, deferred findings, and verification.`;
 
-type ReviewState = { active: boolean; originId?: string };
+type ReviewState = { active: boolean; originId?: string; resumeId?: string };
 
 function getReviewState(ctx: ExtensionContext): ReviewState | undefined {
 	let state: ReviewState | undefined;
@@ -62,13 +63,13 @@ function updateWidget(ctx: ExtensionContext) {
 	ctx.ui.setWidget("review", active ? ["Review active — return with /end-review"] : undefined);
 }
 
-function parseArgs(args: string): { scope: string; fresh: boolean } {
+function parseArgs(args: string): { scope: string; mode: "select" | "fresh" | "resume" } {
 	const request = args.trim();
 	const first = request.split(/\s/, 1)[0];
-	const fresh = first === "--fresh";
-	if (!fresh && first.startsWith("--")) throw new Error(`Unknown /review option: ${first}`);
-	const scope = fresh ? request.slice(first.length).trim() : request;
-	return { scope: scope || "uncommitted changes", fresh };
+	const mode = first === "--fresh" ? "fresh" : first === "--resume" ? "resume" : "select";
+	if (mode === "select" && first.startsWith("--")) throw new Error(`Unknown /review option: ${first}`);
+	const scope = mode === "select" ? request : request.slice(first.length).trim();
+	return { scope: scope || "uncommitted changes", mode };
 }
 
 async function loadReviewGuidelines(cwd: string): Promise<string | undefined> {
@@ -133,7 +134,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	pi.on("session_tree", restore);
 
 	pi.registerCommand("review", {
-		description: "Review a local scope with selected context; --fresh skips selection",
+		description: "Review with selected context, --fresh context, or --resume the previous reviewer",
 		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/review requires interactive mode", "error");
@@ -150,13 +151,22 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			navigating = true;
 			const editorText = ctx.ui.getEditorText();
 			try {
-				const { scope, fresh } = parseArgs(args);
+				const { scope, mode } = parseArgs(args);
+				const resumeId = mode === "resume" ? getReviewState(ctx)?.resumeId : undefined;
+				if (mode === "resume" && (!resumeId || !ctx.sessionManager.getEntry(resumeId))) {
+					throw new Error("No review to resume in this conversation");
+				}
 				const guidelines = await loadReviewGuidelines(ctx.cwd);
 				const firstUser = ctx.sessionManager.getBranch().find(
 					(entry) => entry.type === "message" && entry.message.role === "user",
 				);
-				const target = fresh ? firstUser?.id : firstUser ? await selectContext(ctx, pi, scope) : undefined;
-				if (!fresh && firstUser && !target) return;
+				let target: string | undefined;
+				if (mode === "resume") target = resumeId;
+				else if (mode === "fresh") target = firstUser?.id;
+				else if (firstUser) {
+					target = await selectContext(ctx, pi, scope);
+					if (!target) return;
+				}
 
 				// A custom anchor makes the exact return position navigable even if the
 				// current leaf is a user/custom message (which Pi navigates *before*).
@@ -173,7 +183,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 				updateWidget(ctx);
 				ctx.ui.setEditorText("");
 				let prompt = `Review: ${scope}\n\n${REVIEW_INTRO}`;
-				if (!fresh && target) prompt += `\n\n${REVIEW_CONTEXT}`;
+				if (mode !== "fresh" && target) prompt += `\n\n${REVIEW_CONTEXT}`;
 				prompt += `\n\n${REVIEW_PROMPT}`;
 				if (guidelines) prompt += `\n\n${guidelines}`;
 				pi.sendUserMessage(prompt);
@@ -206,6 +216,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			try {
 				const action = await ctx.ui.select("Finish review:", ["Return only", "Return and summarize", "Return and fix findings"]);
 				if (!action) return;
+				// Remember where we actually leave, including any manual rewinding.
+				pi.appendEntry(REVIEW_ANCHOR_TYPE, {});
+				const resumeId = ctx.sessionManager.getLeafId()!;
 				const originId = state.originId;
 				const result = action === "Return only"
 					? await ctx.navigateTree(originId, { summarize: false })
@@ -219,7 +232,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 					});
 				if ("error" in result) throw result.error;
 				if (result.cancelled) return;
-				pi.appendEntry(REVIEW_STATE_TYPE, { active: false });
+				pi.appendEntry(REVIEW_STATE_TYPE, { active: false, resumeId });
 				updateWidget(ctx);
 				if (action === "Return and fix findings") pi.sendUserMessage(FIX_PROMPT, { deliverAs: "followUp" });
 				ctx.ui.notify("Review complete — returned to original conversation", "info");

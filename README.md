@@ -23,31 +23,19 @@ Give the reviewing agent any free-form request:
 /review last two commits
 /review src/integrator.rs, focusing on numerical stability
 /review --fresh changes since origin/main
+/review --resume Are you satisfied?
 ```
 
 A plain `/review` is equivalent to `/review uncommitted changes`.
+The optional `--fresh` or `--resume` must come first.
 
 ## Choosing the reviewer’s context
 
-The only option is `--fresh`, requesting a review starting with fresh context.
-When given, it must come first.
-
-Without that option,
-the familiar `/tree` selector
-lets you choose the conversation point on which to base the reviewer’s context.
-
-For example,
-the reviewer can retain earlier requirements and discussions,
-or context from implementation work that preceded the change under review.
-
-You can also follow up on an earlier review.
-For example, after implementing a fix, run
-
-```text
-/review Are you satisfied?
-```
-
-selecting the earlier review as context.
+- **No option:** choose a conversation point with the familiar `/tree` selector,
+  retaining earlier requirements, discussions, or implementation context.
+- **`--fresh`:** start before the first user message, without prior discussion.
+- **`--resume`:** continue where the last `/end-review` in the current conversation left the reviewer,
+  for example to reassess fixes with the previous findings in mind.
 
 ## Review methodology
 
